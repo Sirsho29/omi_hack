@@ -8,10 +8,13 @@ import {
   Post,
   Query,
   Res,
+  Sse,
 } from '@nestjs/common';
 import type { Response } from 'express';
-import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { Observable } from 'rxjs';
+import type { AiEvent } from './ai.service.js';
 import { AiService } from './ai.service.js';
 import { McpClientService } from './mcp-client.service.js';
 
@@ -38,6 +41,14 @@ export class AppController {
       status: 'ok',
       authenticated: this.mcpClient.isAuthenticated(),
     };
+  }
+
+  // ─── SSR Page ──────────────────────────────────────────────────
+  @Get('app')
+  servePage(@Res() res: Response) {
+    const htmlPath = join(process.cwd(), 'src', 'public', 'index.html');
+    const html = readFileSync(htmlPath, 'utf-8');
+    res.type('text/html').send(html);
   }
 
   // ─── OAuth Flow ────────────────────────────────────────────────
@@ -83,10 +94,8 @@ export class AppController {
 
       this.logger.log('OAuth complete, MCP client connected');
 
-      res.json({
-        message: 'Authenticated and connected to Swiggy MCP server!',
-        authenticated: true,
-      });
+      // Redirect to the app page after successful auth
+      res.redirect('/app');
     } catch (err) {
       this.logger.error(`OAuth callback failed: ${(err as Error).message}`);
       throw new HttpException(
@@ -208,6 +217,7 @@ export class AppController {
     }
 
     this.logger.log(`Processing Omi transcript: "${transcript.slice(0, 200)}"`);
+    this.aiService.emitEvent('transcript', `Heard: "${transcript}"`);
 
     // If not authenticated, we can't process — return early
     if (!this.mcpClient.isAuthenticated()) {
@@ -301,6 +311,36 @@ export class AppController {
     }
 
     return null;
+  }
+
+  // ─── SSE Events Stream ─────────────────────────────────────────
+
+  /**
+   * GET /events
+   * Server-Sent Events stream for real-time chain-of-thought updates
+   */
+  @Sse('events')
+  sseEvents(): Observable<{ data: string }> {
+    return new Observable((subscriber) => {
+      const handler = (event: AiEvent) => {
+        subscriber.next({ data: JSON.stringify(event) });
+      };
+      this.aiService.events.on('event', handler);
+
+      // Send a connected event immediately
+      subscriber.next({
+        data: JSON.stringify({
+          type: 'thinking',
+          message: 'Connected to event stream. Waiting for Omi transcripts...',
+          timestamp: new Date().toISOString(),
+        }),
+      });
+
+      // Cleanup on disconnect
+      return () => {
+        this.aiService.events.off('event', handler);
+      };
+    });
   }
 
   // ─── Helpers ───────────────────────────────────────────────────

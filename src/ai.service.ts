@@ -1,17 +1,41 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { EventEmitter } from 'node:events';
 import OpenAI from 'openai';
 import { McpClientService } from './mcp-client.service.js';
+
+export interface AiEvent {
+  type:
+    | 'thinking'
+    | 'tool_call'
+    | 'tool_result'
+    | 'response'
+    | 'error'
+    | 'transcript';
+  message: string;
+  data?: unknown;
+  timestamp: string;
+}
 
 @Injectable()
 export class AiService {
   private readonly logger = new Logger(AiService.name);
   private openai: OpenAI;
+  public readonly events = new EventEmitter();
 
   constructor(private readonly mcpClient: McpClientService) {
     this.openai = new OpenAI({
-      apiKey:
-        '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',
+      apiKey: process.env.OPENAI_API_KEY || '',
     });
+  }
+
+  emitEvent(type: AiEvent['type'], message: string, data?: unknown) {
+    const event: AiEvent = {
+      type,
+      message,
+      data,
+      timestamp: new Date().toISOString(),
+    };
+    this.events.emit('event', event);
   }
 
   /**
@@ -49,22 +73,34 @@ export class AiService {
     toolCalls: Array<{ tool: string; args: unknown; result: unknown }>;
   }> {
     // 1. Get available tools from MCP server
+    this.emitEvent(
+      'thinking',
+      'Connecting to Swiggy and discovering available tools...',
+    );
     const mcpTools = await this.mcpClient.listTools();
     this.logger.log(
       `Discovered ${mcpTools.length} MCP tools: ${mcpTools.map((t) => t.name).join(', ')}`,
+    );
+    this.emitEvent(
+      'thinking',
+      `Found ${mcpTools.length} Swiggy tools available`,
     );
 
     const openaiTools = this.mcpToolsToOpenAI(mcpTools);
     const toolCallLog: Array<{ tool: string; args: unknown; result: unknown }> =
       [];
 
-    // Filter out get_addresses tool — we hardcode the address
+    // Filter out tools we don't want the LLM to use
+    const blockedTools = new Set([
+      'get_addresses',
+      'create_cart',
+      'add_to_cart',
+    ]);
     const filteredTools = openaiTools.filter((t) => {
       if (t.type === 'function' && 'function' in t) {
-        return (
-          (t as { type: 'function'; function: { name: string } }).function
-            .name !== 'get_addresses'
-        );
+        const name = (t as { type: 'function'; function: { name: string } })
+          .function.name;
+        return !blockedTools.has(name);
       }
       return true;
     });
@@ -74,13 +110,17 @@ export class AiService {
       {
         role: 'system',
         content:
-          'You are a helpful assistant with access to Swiggy tools. Use the available tools to help the user with their food ordering, restaurant search, and delivery needs. Always call tools when the user asks for something that requires fetching data or performing actions.\n\nIMPORTANT: The user\'s address_id is always "d0hfrab7gis2gb0kpm50". Never call get_addresses. Whenever a tool requires an address_id parameter, use "d0hfrab7gis2gb0kpm50".\n\nIMPORTANT: After calling search_products, ALWAYS automatically select the first product/item from the results without asking the user. Proceed immediately with that first option for any subsequent actions (e.g. adding to cart, viewing details).',
+          'You are a helpful assistant with access to Swiggy tools. Use the available tools to help the user with their food ordering, restaurant search, and delivery needs. Always call tools when the user asks for something that requires fetching data or performing actions.\n\nIMPORTANT: The user\'s address_id is always "d0hfrab7gis2gb0kpm50". Never call get_addresses. Whenever a tool requires an address_id parameter, use "d0hfrab7gis2gb0kpm50".\n\nIMPORTANT: After calling search_products, ALWAYS automatically select the first product/item from the results without asking the user. Proceed immediately with that first option for any subsequent actions (e.g. adding to cart, viewing details).\n\nIMPORTANT: ALWAYS use modify_cart to add or update items in the cart. NEVER use create_cart or add_to_cart. If you need to add items, use modify_cart to update the existing cart. This avoids creating duplicate carts.',
       },
       { role: 'user', content: prompt },
     ];
 
     // 3. Tool-calling loop
     for (let i = 0; i < maxIterations; i++) {
+      this.emitEvent(
+        'thinking',
+        i === 0 ? 'Analyzing your request...' : 'Thinking about next step...',
+      );
       const completion = await this.openai.chat.completions.create({
         model: 'gpt-4o',
         messages,
@@ -100,6 +140,7 @@ export class AiService {
         !assistantMessage.tool_calls ||
         assistantMessage.tool_calls.length === 0
       ) {
+        this.emitEvent('response', assistantMessage.content || 'Done.');
         return {
           response: assistantMessage.content || 'No response generated.',
           toolCalls: toolCallLog,
@@ -122,6 +163,11 @@ export class AiService {
         }
 
         this.logger.log(`Executing tool: ${toolName}`);
+        this.emitEvent(
+          'tool_call',
+          `Calling ${this.friendlyToolName(toolName)}...`,
+          { tool: toolName, args: toolArgs },
+        );
 
         // Inject hardcoded address_id if the tool expects it
         if ('address_id' in toolArgs || toolName.includes('address')) {
@@ -137,10 +183,19 @@ export class AiService {
             const mcpResult = await this.mcpClient.callTool(toolName, toolArgs);
             toolResult = mcpResult.content;
           }
+          this.emitEvent(
+            'tool_result',
+            this.friendlyToolResult(toolName, toolResult),
+            { tool: toolName, result: toolResult },
+          );
         } catch (err) {
           toolResult = { error: (err as Error).message };
           this.logger.error(
             `Tool ${toolName} failed: ${(err as Error).message}`,
+          );
+          this.emitEvent(
+            'error',
+            `Tool ${this.friendlyToolName(toolName)} failed: ${(err as Error).message}`,
           );
         }
 
@@ -180,5 +235,44 @@ export class AiService {
       description: t.description,
       parameters: t.inputSchema,
     }));
+  }
+
+  private friendlyToolName(toolName: string): string {
+    const map: Record<string, string> = {
+      search_products: 'Search Products',
+      modify_cart: 'Update Cart',
+      add_to_cart: 'Add to Cart',
+      get_cart: 'View Cart',
+      remove_from_cart: 'Remove from Cart',
+      place_order: 'Place Order',
+      get_addresses: 'Get Addresses',
+      search_restaurants: 'Search Restaurants',
+      get_restaurant_menu: 'Get Menu',
+      get_order_status: 'Order Status',
+    };
+    return (
+      map[toolName] ||
+      toolName.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+    );
+  }
+
+  private friendlyToolResult(toolName: string, result: unknown): string {
+    try {
+      if (toolName === 'search_products') {
+        return 'Found products! Selecting the first option...';
+      }
+      if (toolName === 'add_to_cart' || toolName === 'modify_cart') {
+        return 'Cart updated!';
+      }
+      if (toolName === 'get_cart') {
+        return 'Retrieved cart contents';
+      }
+      if (toolName === 'place_order') {
+        return 'Order placed successfully!';
+      }
+      return `Got results from ${this.friendlyToolName(toolName)}`;
+    } catch {
+      return 'Received result';
+    }
   }
 }
