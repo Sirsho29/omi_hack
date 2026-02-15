@@ -177,7 +177,7 @@ export class McpClientService {
       );
       await this.client.connect(transport);
       this.logger.log('Connected via Streamable HTTP transport');
-    } catch (err) {
+    } catch (_err) {
       this.logger.warn(
         'Streamable HTTP failed, falling back to SSE transport...',
       );
